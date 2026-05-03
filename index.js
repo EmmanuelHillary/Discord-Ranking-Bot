@@ -427,7 +427,7 @@ client.on("voiceStateUpdate", (oldState, newState) => {
     const joinTime = voiceSessions.get(userId);
     if (joinTime) {
       const minutes = Math.floor((Date.now() - joinTime) / 60_000);
-      if (minutes >= 1) {
+      if (minutes >= 5) { // Minimum 5 minutes to earn points
         const earned = minutes * config.VOICE_MINUTE;
         db.incrementStat(userId, username, "voiceMinutes");
         db.addPoints(userId, username, earned, `${minutes} min in voice`);
