@@ -18,7 +18,7 @@ module.exports = {
 
   // ─── Cooldowns (ms) ──────────────────────────────────────────────
   MESSAGE_COOLDOWN: 10_000,        // 10s between message point awards (anti-spam)
-  REACTION_COOLDOWN: 5_000,        // 5s between reaction point awards
+  REACTION_COOLDOWN: 15_000,        // 15s between reaction point awards
 
   // ─── Rank Titles ─────────────────────────────────────────────────
   RANK_TITLES: [
