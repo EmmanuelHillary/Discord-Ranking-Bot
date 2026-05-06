@@ -41,12 +41,61 @@ const client = new Client({
 // ─── Runtime state ────────────────────────────────────────────────────────────
 const messageCooldowns  = new Collection(); // userId → last award ms
 const reactionCooldowns = new Collection(); // userId → last award ms
-const dailyFirstMessage = new Collection(); // userId → "YYYY-MM-DD"
-const voiceSessions     = new Collection(); // userId → join timestamp ms
+const threadCooldowns   = new Collection(); // userId → last award ms
+const voiceSessions     = new Collection(); // userId → session info
 
-// Cached message IDs for the three pinned ranking embeds.
-// Populated on first post/rediscover; lets us edit-in-place without scanning.
+// Cached message IDs for the three pinned ranking embeds
 const rankingMsgIds = { header: null, leaderboard: null, commands: null };
+
+// ─── Anti-Farm Detection ─────────────────────────────────────────────────────
+// In-memory state for fast detection — penalties are persisted via deductPoints.
+const recentMessages    = new Map(); // userId → [{ content, ts }]
+const recentReactions   = new Map(); // userId → [ts, ts, ...]
+const recentVoiceJoins  = new Map(); // userId → [ts, ts, ...]
+const lastFarmPenaltyAt = new Map(); // userId → ts of last penalty
+
+function applyFarmPenalty(userId, username, reason) {
+  const now  = Date.now();
+  const last = lastFarmPenaltyAt.get(userId) || 0;
+  if (now - last < config.FARM_PENALTY_COOLDOWN) return false;
+  lastFarmPenaltyAt.set(userId, now);
+  db.deductPoints(userId, username, config.FARM_PENALTY, `[Anti-farm] ${reason}`);
+  console.log(`🚨 [ANTI-FARM] -${config.FARM_PENALTY} pts from ${username} — ${reason}`);
+  return true;
+}
+
+function detectRepeatedContent(userId, content) {
+  const norm = (content || "").trim().toLowerCase();
+  if (norm.length < 2) return false; // ignore very short / empty
+  const now    = Date.now();
+  const list   = (recentMessages.get(userId) || []).filter(
+    (e) => now - e.ts < config.FARM_REPEAT_WINDOW
+  );
+  list.push({ content: norm, ts: now });
+  recentMessages.set(userId, list);
+  const sameCount = list.filter((e) => e.content === norm).length;
+  return sameCount >= config.FARM_REPEAT_THRESHOLD;
+}
+
+function detectReactionBurst(userId) {
+  const now  = Date.now();
+  const list = (recentReactions.get(userId) || []).filter(
+    (t) => now - t < config.FARM_REACTION_BURST_WINDOW
+  );
+  list.push(now);
+  recentReactions.set(userId, list);
+  return list.length > config.FARM_REACTION_BURST_LIMIT;
+}
+
+function detectVoiceRejoinSpam(userId) {
+  const now  = Date.now();
+  const list = (recentVoiceJoins.get(userId) || []).filter(
+    (t) => now - t < config.FARM_VOICE_REJOIN_WINDOW
+  );
+  list.push(now);
+  recentVoiceJoins.set(userId, list);
+  return list.length >= config.FARM_VOICE_REJOIN_THRESHOLD;
+}
 
 // ─── Slash Command Definitions ────────────────────────────────────────────────
 const commands = [
@@ -97,6 +146,23 @@ const commands = [
     ),
 
   new SlashCommandBuilder()
+    .setName("resetpoints")
+    .setDescription("Reset points for a user, or for everyone (Admin only)")
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addUserOption((opt) =>
+      opt
+        .setName("user")
+        .setDescription("Target user. Omit to reset every member.")
+        .setRequired(false)
+    )
+    .addStringOption((opt) =>
+      opt
+        .setName("confirm")
+        .setDescription('Type "CONFIRM" to authorise a server-wide reset')
+        .setRequired(false)
+    ),
+
+  new SlashCommandBuilder()
     .setName("history")
     .setDescription("View recent point activity on the server"),
 
@@ -120,7 +186,7 @@ async function registerCommands() {
   }
 }
 
-// ─── Ensure #ranking channel exists ──────────────────────────────────────────
+// ─── Ensure #ranking channel exists & is locked down ─────────────────────────
 async function ensureRankingChannel(guild) {
   let channel = null;
 
@@ -141,17 +207,32 @@ async function ensureRankingChannel(guild) {
     channel = await guild.channels.create({
       name: "ranking",
       type: ChannelType.GuildText,
-      topic: "🏆 Server leaderboard & points system — use /rank, /history, /leaderboard here",
+      topic:
+        "🏆 Server leaderboard & points system — view-only. Use /rank, /history, /leaderboard.",
     });
     console.log(`✅ Created #ranking channel: ${channel.id}`);
   }
 
+  // Read-only for @everyone: can view & read history, cannot send, react,
+  // create threads, or use voice. Bot retains full management rights.
   try {
     await channel.permissionOverwrites.set([
       {
         id: guild.roles.everyone,
-        allow: ["ViewChannel", "ReadMessageHistory", "UseApplicationCommands"],
-        deny: ["SendMessages"],
+        allow: [
+          "ViewChannel",
+          "ReadMessageHistory",
+          "UseApplicationCommands",
+        ],
+        deny: [
+          "SendMessages",
+          "AddReactions",
+          "CreatePublicThreads",
+          "CreatePrivateThreads",
+          "SendMessagesInThreads",
+          "AttachFiles",
+          "EmbedLinks",
+        ],
       },
       {
         id: guild.members.me.id,
@@ -162,10 +243,13 @@ async function ensureRankingChannel(guild) {
           "ReadMessageHistory",
           "UseApplicationCommands",
           "ManageChannels",
+          "AddReactions",
+          "EmbedLinks",
+          "AttachFiles",
         ],
       },
     ]);
-    console.log(`✅ Permissions set on #${channel.name}`);
+    console.log(`✅ Permissions locked down on #${channel.name} (read-only for members)`);
   } catch (err) {
     console.warn(`⚠️  Could not set permissions on #${channel.name}:`, err.message);
   }
@@ -174,14 +258,11 @@ async function ensureRankingChannel(guild) {
 }
 
 // Cached channel object — set once on startup, reused on every cron tick.
-// Re-calling ensureRankingChannel() on every tick caused permission rewrites
-// that rate-limited the bot and silently broke the 5-min update loop.
 let rankingChannel = null;
 
 // ─── Update Ranking Channel (edit-in-place) ───────────────────────────────────
 async function updateRankingChannel() {
   try {
-    // Use the cached channel; fall back to re-fetching only if it somehow got lost
     if (!rankingChannel) {
       const guild = client.guilds.cache.first();
       if (!guild) { console.warn("⚠️  updateRankingChannel: no guild in cache"); return; }
@@ -194,7 +275,6 @@ async function updateRankingChannel() {
     const top20Embed    = buildTop20Embed();
     const commandsEmbed = buildCommandsEmbed();
 
-    // ── Fast path: edit by cached IDs ────────────────────────────────────────
     if (rankingMsgIds.header && rankingMsgIds.leaderboard && rankingMsgIds.commands) {
       try {
         const [m1, m2, m3] = await Promise.all([
@@ -213,11 +293,10 @@ async function updateRankingChannel() {
       }
     }
 
-    // ── Slow path: scan for existing bot messages ─────────────────────────────
     const fetched = await channel.messages.fetch({ limit: 50 });
     const botMsgs = [...fetched.values()]
       .filter((m) => m.author.id === client.user.id)
-      .sort((a, b) => a.createdTimestamp - b.createdTimestamp); // oldest first
+      .sort((a, b) => a.createdTimestamp - b.createdTimestamp);
 
     if (botMsgs.length >= 3) {
       await botMsgs[0].edit({ embeds: [headerEmbed] });
@@ -228,13 +307,11 @@ async function updateRankingChannel() {
       rankingMsgIds.leaderboard = botMsgs[1].id;
       rankingMsgIds.commands    = botMsgs[2].id;
 
-      // Clean up any stray extra bot messages
       for (let i = 3; i < botMsgs.length; i++) {
         try { await botMsgs[i].delete(); } catch {}
       }
       console.log(`✅ [${new Date().toISOString()}] Ranking channel updated (rediscovered).`);
     } else {
-      // Clean slate
       for (const m of botMsgs) {
         try { await m.delete(); } catch {}
       }
@@ -247,17 +324,14 @@ async function updateRankingChannel() {
       rankingMsgIds.leaderboard = m2.id;
       rankingMsgIds.commands    = m3.id;
 
-      // Pin each message then immediately delete the "pinned a message"
-      // system notification Discord auto-posts — keeps the channel silent.
       for (const m of [m1, m2, m3]) {
         try {
           await m.pin();
-          // Give Discord ~400 ms to post the system pin notification, then nuke it
           await new Promise((r) => setTimeout(r, 400));
           const recent = await channel.messages.fetch({ limit: 5 });
           const pinNotice = recent.find(
             (msg) =>
-              msg.type === 6 && // MessageType.ChannelPinnedMessage = 6
+              msg.type === 6 &&
               msg.author.id === client.user.id &&
               Date.now() - msg.createdTimestamp < 10_000
           );
@@ -268,12 +342,10 @@ async function updateRankingChannel() {
       console.log(`✅ [${new Date().toISOString()}] Ranking channel: fresh messages posted & pinned.`);
     }
   } catch (err) {
-    // Log but DO NOT re-throw — a throw here would kill the cron tick
     console.error(`❌ [${new Date().toISOString()}] updateRankingChannel error:`, err);
   }
 }
 
-// Safe cron wrapper — any error is caught so future ticks always fire
 function safeCronUpdate() {
   updateRankingChannel().catch((err) =>
     console.error("❌ safeCronUpdate caught:", err)
@@ -299,6 +371,27 @@ async function syncAllMembers(guild) {
   }
 }
 
+// ─── Voice quality scan ──────────────────────────────────────────────────────
+// Every minute, walk active voice sessions and accumulate ineligible time:
+//   • selfDeafened minutes don't count
+//   • alone-in-channel minutes don't count
+// At session end, those minutes are subtracted from gross duration.
+function startVoiceQualityScan() {
+  setInterval(() => {
+    for (const [userId, session] of voiceSessions) {
+      try {
+        const guild  = client.guilds.cache.first();
+        const member = guild?.members.cache.get(userId);
+        if (!member?.voice?.channel) continue;
+
+        const humans = member.voice.channel.members.filter((m) => !m.user.bot).size;
+        if (humans < 2)            session.aloneMinutes    = (session.aloneMinutes    || 0) + 1;
+        if (member.voice.selfDeaf) session.deafenedMinutes = (session.deafenedMinutes || 0) + 1;
+      } catch {}
+    }
+  }, 60_000);
+}
+
 // ─── Ready ────────────────────────────────────────────────────────────────────
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
@@ -311,37 +404,53 @@ client.once("ready", async () => {
 
   await updateRankingChannel();
 
-  // Store the channel reference so cron ticks never re-run ensureRankingChannel
   if (!rankingChannel) {
     const guild2 = client.guilds.cache.first();
     if (guild2) rankingChannel = await ensureRankingChannel(guild2);
   }
 
-  // ── FIX: use safeCronUpdate so any error in one tick never kills the cron ──
+  startVoiceQualityScan();
+
   cron.schedule("*/5 * * * *", () => {
     console.log(`⏰ [${new Date().toISOString()}] Cron tick — refreshing ranking channel...`);
     safeCronUpdate();
   });
 
-  // Monthly MVP announcement at midnight on the 1st of each month
+  // Daily housekeeping: prune old reaction-award entries to keep the DB small
+  cron.schedule("0 4 * * *", () => {
+    const dropped = db.cleanupReactionAwards(30);
+    if (dropped) console.log(`🧹 Pruned ${dropped} old reaction-award entries`);
+  });
+
+  // Monthly MVP announcement at midnight on the 1st of each month.
+  // FIX: query the *previous* month's bucket, not the current one (which has
+  // just rolled over to zero at the moment this cron fires).
   cron.schedule("0 0 1 * *", async () => {
     try {
-      const topMonth = db.getMonthlyLeaderboard(1);
-      if (!topMonth.length) return;
+      const prevMK   = db.previousMonthKey();
+      const topPrev  = db.getMonthlyLeaderboard(1, prevMK);
 
-      const winner    = topMonth[0];
-      const mk        = db.currentMonthKey();
-      const pts       = db.getMonthPoints(winner, mk);
+      if (!topPrev.length) {
+        console.log("Monthly MVP: no activity in previous month — skipping announcement.");
+        await updateRankingChannel();
+        return;
+      }
+
+      const winner    = topPrev[0];
+      const pts       = db.getMonthPoints(winner, prevMK);
       const now       = new Date();
       const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
       const label     = prevMonth.toLocaleString("default", { month: "long", year: "numeric" });
 
       const channel = await client.channels.fetch(process.env.RANKING_CHANNEL_ID);
       if (channel) {
-        // Silent mention — no @everyone/@here, just plain text
         await channel.send({
-          content: `🎉 **Monthly MVP — ${label}!**\n\nCongrats to **${winner.username}** who earned the most points this month with **${pts.toFixed(1)} pts**! 🏆\nThey get to **suggest our next video idea** — stay tuned! 🎬\n\n_Points carry over — keep grinding for next month!_`,
-          // flags: 4096 would suppress embeds but this is a plain message, leave as-is
+          content:
+            `🎉 **Monthly MVP — ${label}!**\n\n` +
+            `Congrats to **${winner.username}** who earned the most points last month with ` +
+            `**${pts.toFixed(1)} pts**! 🏆\n` +
+            `They get to **suggest our next video idea** — stay tuned! 🎬\n\n` +
+            `_Points carry over — keep grinding for next month!_`,
         });
       }
     } catch (err) {
@@ -356,7 +465,7 @@ client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   if (!message.guild) return;
 
-  // Never award points for messages in the ranking channel itself
+  // Never award (or anti-farm-scan) for messages in the ranking channel itself
   if (
     process.env.RANKING_CHANNEL_ID &&
     message.channelId === process.env.RANKING_CHANNEL_ID
@@ -365,7 +474,12 @@ client.on("messageCreate", async (message) => {
   const userId   = message.author.id;
   const username = message.author.username;
 
-  // Cooldown gate
+  // ── Anti-farm: repeated identical content
+  if (detectRepeatedContent(userId, message.content)) {
+    applyFarmPenalty(userId, username, "repeated identical messages");
+  }
+
+  // ── Cooldown gate
   const now       = Date.now();
   const lastAward = messageCooldowns.get(userId) || 0;
   if (now - lastAward < config.MESSAGE_COOLDOWN) return;
@@ -384,10 +498,10 @@ client.on("messageCreate", async (message) => {
     reason += " + file share";
   }
 
-  // Daily first-message bonus (keyed to UTC date so restarts don't re-award)
+  // Daily first-message bonus — persisted, so a restart doesn't re-award
   const today = new Date().toISOString().slice(0, 10);
-  if (dailyFirstMessage.get(userId) !== today) {
-    dailyFirstMessage.set(userId, today);
+  if (db.getDailyFirst(userId) !== today) {
+    db.setDailyFirst(userId, today);
     points += config.FIRST_MESSAGE_OF_DAY;
     reason += " + daily bonus";
   }
@@ -399,17 +513,56 @@ client.on("messageCreate", async (message) => {
 
 // ─── Reaction Add ─────────────────────────────────────────────────────────────
 client.on("messageReactionAdd", async (reaction, user) => {
-  if (user.bot) return;
-  if (!reaction.message.guild) return;
+  try {
+    if (user.bot) return;
 
-  const now       = Date.now();
-  const lastAward = reactionCooldowns.get(user.id) || 0;
-  if (now - lastAward < config.REACTION_COOLDOWN) return;
-  reactionCooldowns.set(user.id, now);
+    // Resolve partials so we have message author + IDs
+    if (reaction.partial)         await reaction.fetch();
+    if (reaction.message.partial) await reaction.message.fetch();
+    if (!reaction.message.guild)  return;
 
-  db.incrementStat(user.id, user.username, "reactions");
-  db.addPoints(user.id, user.username, config.REACTION_ADDED, "reaction added");
-  console.log(`👍 [POINTS] ${user.username} +${config.REACTION_ADDED} pts — reaction`);
+    // Don't award for reactions in the ranking channel
+    if (
+      process.env.RANKING_CHANNEL_ID &&
+      reaction.message.channelId === process.env.RANKING_CHANNEL_ID
+    ) return;
+
+    const messageId = reaction.message.id;
+    const author    = reaction.message.author;
+
+    // ── Loophole: don't award for reacting to the user's own message
+    if (author && author.id === user.id) {
+      applyFarmPenalty(user.id, user.username, "self-reaction");
+      return;
+    }
+
+    // ── Loophole: don't award for reactions on bot messages
+    if (author && author.bot) return;
+
+    // ── Reaction-once: no re-award for unreact + react
+    if (db.hasReactionAward(user.id, messageId)) return;
+
+    // ── Reaction-burst farm detection
+    if (detectReactionBurst(user.id)) {
+      applyFarmPenalty(user.id, user.username, "reaction burst");
+      return; // skip award on flagged burst
+    }
+
+    // ── Cooldown gate (still applies to space awards over time)
+    const now       = Date.now();
+    const lastAward = reactionCooldowns.get(user.id) || 0;
+    if (now - lastAward < config.REACTION_COOLDOWN) return;
+    reactionCooldowns.set(user.id, now);
+
+    // Record the (user, message) award BEFORE crediting so concurrent
+    // re-reactions can't double-award.
+    db.recordReactionAward(user.id, messageId);
+    db.incrementStat(user.id, user.username, "reactions");
+    db.addPoints(user.id, user.username, config.REACTION_ADDED, "reaction added");
+    console.log(`👍 [POINTS] ${user.username} +${config.REACTION_ADDED} pts — reaction`);
+  } catch (err) {
+    console.error("messageReactionAdd error:", err);
+  }
 });
 
 // ─── Voice State Update ───────────────────────────────────────────────────────
@@ -418,23 +571,47 @@ client.on("voiceStateUpdate", (oldState, newState) => {
   const username =
     newState.member?.user?.username || oldState.member?.user?.username || "Unknown";
 
+  // ── Joined voice
   if (!oldState.channelId && newState.channelId) {
-    voiceSessions.set(userId, Date.now());
+    voiceSessions.set(userId, {
+      joinTime: Date.now(),
+      aloneMinutes: 0,
+      deafenedMinutes: 0,
+    });
     console.log(`🎙️  ${username} joined voice`);
+
+    // Anti-farm: rapid voice rejoin spam
+    if (detectVoiceRejoinSpam(userId)) {
+      applyFarmPenalty(userId, username, "voice rejoin spam");
+    }
+    return;
   }
 
+  // ── Left voice
   if (oldState.channelId && !newState.channelId) {
-    const joinTime = voiceSessions.get(userId);
-    if (joinTime) {
-      const minutes = Math.floor((Date.now() - joinTime) / 60_000);
-      if (minutes >= 5) { // Minimum 5 minutes to earn points
-        const earned = minutes * config.VOICE_MINUTE;
-        db.incrementStat(userId, username, "voiceMinutes");
-        db.addPoints(userId, username, earned, `${minutes} min in voice`);
-        console.log(`🎙️  [POINTS] ${username} +${earned} pts — ${minutes} min voice`);
-      }
-      voiceSessions.delete(userId);
+    const session = voiceSessions.get(userId);
+    if (!session) return;
+
+    const grossMinutes = Math.floor((Date.now() - session.joinTime) / 60_000);
+    const ineligible   = (session.aloneMinutes || 0) + (session.deafenedMinutes || 0);
+    const effective    = Math.max(0, grossMinutes - ineligible);
+
+    if (effective >= config.VOICE_MIN_MINUTES) {
+      const earned = effective * config.VOICE_MINUTE;
+      db.incrementStat(userId, username, "voiceMinutes");
+      db.addPoints(userId, username, earned, `${effective} min in voice`);
+      console.log(
+        `🎙️  [POINTS] ${username} +${earned} pts — ${effective} min ` +
+        `(gross ${grossMinutes}, ineligible ${ineligible})`
+      );
+    } else if (grossMinutes >= config.VOICE_MIN_MINUTES) {
+      console.log(
+        `🚫 [VOICE] ${username} — ${grossMinutes} min logged but ${ineligible} ineligible ` +
+        `(alone/deafened); no points`
+      );
     }
+
+    voiceSessions.delete(userId);
   }
 });
 
@@ -444,6 +621,13 @@ client.on("threadCreate", async (thread) => {
   try {
     const owner = await client.users.fetch(thread.ownerId);
     if (owner.bot) return;
+
+    // Anti-farm: cooldown per-user so thread spam can't farm
+    const now       = Date.now();
+    const lastAward = threadCooldowns.get(owner.id) || 0;
+    if (now - lastAward < config.THREAD_COOLDOWN) return;
+    threadCooldowns.set(owner.id, now);
+
     db.addPoints(owner.id, owner.username, config.THREAD_CREATED, "created a thread");
     console.log(`🧵 [POINTS] ${owner.username} +${config.THREAD_CREATED} pts — thread`);
   } catch {}
@@ -471,27 +655,21 @@ client.on("interactionCreate", async (interaction) => {
   if (commandName === "rank") {
     const targetUser = interaction.options.getUser("user");
 
-    // Individual rank card
     if (targetUser) {
       db.getUser(targetUser.id, targetUser.username);
       const embed = buildRankEmbed(targetUser.id);
       if (!embed) {
-        return interaction.reply({
-          content: "No data found for that user yet.",
-        });
+        return interaction.reply({ content: "No data found for that user yet." });
       }
       return interaction.reply({ embeds: [embed] });
     }
 
-    // Leaderboard list
     const mode  = interaction.options.getString("mode") || "top";
     const count = interaction.options.getInteger("count") || 10;
     const users = db.getLeaderboard(count, mode);
 
     if (!users.length) {
-      return interaction.reply({
-        content: "No users on the leaderboard yet.",
-      });
+      return interaction.reply({ content: "No users on the leaderboard yet." });
     }
 
     const medals    = ["🥇", "🥈", "🥉"];
@@ -534,6 +712,9 @@ client.on("interactionCreate", async (interaction) => {
 
   // ── /addpoints ─────────────────────────────────────────────────────────────
   if (commandName === "addpoints") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: "🚫 Admin only.", ephemeral: true });
+    }
     const target = interaction.options.getUser("user");
     const amount = interaction.options.getNumber("amount");
     const reason = interaction.options.getString("reason");
@@ -541,7 +722,6 @@ client.on("interactionCreate", async (interaction) => {
     const updated = db.addPoints(target.id, target.username, amount, `[Admin] ${reason}`);
     db.incrementStat(target.id, target.username, "challenges");
 
-    // Confirmation visible to the channel
     await interaction.reply({
       content: `✅ Added **${amount} pts** to **${target.username}** for: *${reason}*\nNew total: **${updated.points.toFixed(1)} pts**`,
     });
@@ -551,6 +731,9 @@ client.on("interactionCreate", async (interaction) => {
 
   // ── /deductpoints ──────────────────────────────────────────────────────────
   if (commandName === "deductpoints") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+      return interaction.reply({ content: "🚫 Admin only.", ephemeral: true });
+    }
     const target = interaction.options.getUser("user");
     const amount = interaction.options.getNumber("amount");
     const reason = interaction.options.getString("reason");
@@ -564,13 +747,55 @@ client.on("interactionCreate", async (interaction) => {
     return;
   }
 
+  // ── /resetpoints ───────────────────────────────────────────────────────────
+  if (commandName === "resetpoints") {
+    if (!interaction.memberPermissions?.has(PermissionFlagsBits.Administrator)) {
+      return interaction.reply({
+        content: "🚫 This command requires the **Administrator** permission.",
+        ephemeral: true,
+      });
+    }
+
+    const target  = interaction.options.getUser("user");
+    const confirm = (interaction.options.getString("confirm") || "").trim();
+
+    if (target) {
+      const result = db.resetPoints(target.id);
+      if (!result) {
+        return interaction.reply({
+          content: `No points record found for **${target.username}**.`,
+          ephemeral: true,
+        });
+      }
+      await interaction.reply({
+        content: `🧹 Points reset for **${target.username}**. They are now back to **0 pts**.`,
+      });
+      await updateRankingChannel();
+      return;
+    }
+
+    // Server-wide reset requires explicit confirmation
+    if (confirm !== "CONFIRM") {
+      return interaction.reply({
+        content:
+          "⚠️ **Server-wide reset.** This wipes everyone's points and monthly buckets.\n" +
+          'Re-run with `confirm: CONFIRM` to proceed.',
+        ephemeral: true,
+      });
+    }
+    const count = db.resetAllPoints();
+    await interaction.reply({
+      content: `🧹 Reset points for **${count}** members. Monthly buckets cleared.`,
+    });
+    await updateRankingChannel();
+    return;
+  }
+
   // ── /history ───────────────────────────────────────────────────────────────
   if (commandName === "history") {
     const history = db.getAllHistory(15);
     if (!history.length) {
-      return interaction.reply({
-        content: "No activity recorded yet.",
-      });
+      return interaction.reply({ content: "No activity recorded yet." });
     }
 
     const lines = history.map((h) => {
