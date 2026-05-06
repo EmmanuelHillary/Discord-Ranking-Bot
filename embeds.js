@@ -96,9 +96,23 @@ function buildPointSystemEmbed() {
 
     "**✦  GENERAL ENGAGEMENT**",
     "```yaml",
-    "  💬  Send a message     →  0.5 pts  ⏱ 10s cooldown",
-    "  👍  Add a reaction     →  0.5 pts  ⏱  5s cooldown",
+    "  💬  Send a message     →  0.5 pts   ⏱ 10s cooldown",
+    "  👍  Add a reaction     →  0.05 pts  ⏱ 15s cooldown",
     "```",
+    "",
+
+    "╔══════════════════════════════════════╗",
+    "║              **FAIR-PLAY RULES**             ║",
+    "╚══════════════════════════════════════╝",
+    "",
+    "> **🚨 ANTI-FARM ENFORCEMENT — −10 PTS PER DETECTION 🚨**",
+    "> **Automated detection deducts 10 points each time it catches:**",
+    "> **• Repeated/spammed identical messages**",
+    "> **• Reacting to your own messages**",
+    "> **• Reaction-bursts (rapid mass reactions)**",
+    "> **• Voice rejoin spam (joining/leaving repeatedly)**",
+    "> **• Sitting alone or self-deafened in voice — those minutes don't count**",
+    "> **• Reacting/un-reacting on the same message — only the FIRST reaction earns a point**",
     "",
 
     "╔══════════════════════════════════════╗",
@@ -222,6 +236,8 @@ function buildCommandsEmbed() {
   const adminRows = [
     ["/addpoints @user <pts> <reason>",   "Award points manually"],
     ["/deductpoints @user <pts> <reason>","Remove points  (floor: 0)"],
+    ["/resetpoints @user",                "Reset one user back to 0"],
+    ["/resetpoints confirm:CONFIRM",      "Reset EVERY member  (Admin role)"],
   ];
 
   const COL_CMD  = 32;
@@ -257,7 +273,9 @@ function buildCommandsEmbed() {
     "  • Auto-tracked: messages, reactions, voice, files,",
     "    threads, daily bonuses, and long messages",
     "  • Monthly MVP is announced on the 1st of each month",
-    "  • Points never reset — all activity is logged via /history",
+    "  • Reactions earn 0.05 pts — ONCE per message per user",
+    "  • Anti-farm system auto-deducts 10 pts per detection",
+    "  • /resetpoints requires Administrator role",
     "  • Use /addpoints to credit solved community challenges",
     "```",
   ].join("\n");
